@@ -2201,8 +2201,9 @@ class PMProGateway_stripe extends PMProGateway {
 		$codes = $wpdb->get_col( "SELECT code FROM $wpdb->pmpro_membership_orders WHERE user_id = '" . esc_sql( $order->user_id ) . "' AND subscription_transaction_id = '" . esc_sql( $order->subscription_transaction_id ) . "' AND status NOT IN('refunded', 'review', 'token', 'error')" );
 
 		//find the one for this order
+		//search price->metadata for code match since Prices don't have ID overrides like Plans do
 		foreach ( $subscriptions->data as $sub ) {
-			if ( in_array( $sub->plan->id, $codes ) ) {
+			if ( in_array( $sub->plan->id, $codes ) || in_array( $sub->price->metadata->code, $codes ) ) {
 				return $sub;
 			}
 		}
@@ -2231,7 +2232,7 @@ class PMProGateway_stripe extends PMProGateway {
 	 *
 	 * Check the membership_levelmeta for the stripe_product_id
 	 *
-	 * @param string $level_id the PMPro membership level id
+	 * @param  string $level_id the PMPro membership level id
 	 * @return array
 	 */
 	function getStripeProductId( $level_id ) {
@@ -2248,7 +2249,7 @@ class PMProGateway_stripe extends PMProGateway {
 	/**
 	 * Get Stripe Prices by Product ID.
 	 *
-	 * @param string $level_id the PMPro membership level id
+	 * @param  string $level_id the PMPro membership level id
 	 * @return array|bool
 	 */
 	function getStripePricesByProduct( $product_id ) {
@@ -2464,6 +2465,10 @@ class PMProGateway_stripe extends PMProGateway {
 		} else {
 			//create Stripe Price
 			try {
+				//@NOTE According to documentation, Stripe Prices do not include an ID override (Plans do)
+				//Plan `id` was set to the MemberOrder `code`, for cross-refs.
+				//Plan `id` was passed to Stripe_Subscription::create as an `item[]`
+				//Adding as metadata->code for referencing if needed
 				$price = array(
 					"currency"    => strtolower( $pmpro_currency ),
 					"product"     => $stripe_product_id,
@@ -2471,9 +2476,12 @@ class PMProGateway_stripe extends PMProGateway {
 					"recurring"   => array(
 						"interval"          => strtolower( $order->BillingPeriod ),
 						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days
+						"trial_period_days" => $trial_period_days //@LINK https://stripe.com/docs/billing/migration/migrating-prices
 					),
-					"tax_behavior" => "unspecified"
+					"tax_behavior" => "unspecified",
+					"metadata"     => array(
+						"code" => $order->code //attach as metadata since Prices don't have `id` overrides
+					)
 				);
 				$price = self::add_application_fee_amount( $price );
 				$price = Stripe_Price::create( $price );
@@ -3294,6 +3302,187 @@ class PMProGateway_stripe extends PMProGateway {
 		return true;
 	}
 
+	/**
+	 * Create a Stripe Product.
+	 *
+	 * Get/Create Stripe Product.
+	 * Add/Update Stripe Product to pmpro_membership_levelmeta table.
+	 * Get/Create Stripe Price.
+	 *
+	 * @param  object $order a MemberOrder object
+	 * @return array  a Stripe Price object
+	 */
+	function create_product( &$order ) {
+
+		global $pmpro_currencies, $pmpro_currency;
+
+		//figure out the amounts
+		$amount     = $order->PaymentAmount;
+		$amount_tax = $order->getTaxForPrice( $amount );
+		$amount     = pmpro_round_price( (float) $amount + (float) $amount_tax );
+
+		// Account for zero-decimal currencies like the Japanese Yen
+		$currency_unit_multiplier = 100; //ie 100 cents per USD
+		if ( is_array( $pmpro_currencies[ $pmpro_currency ] ) && isset( $pmpro_currencies[ $pmpro_currency ]['decimals'] ) && $pmpro_currencies[ $pmpro_currency ]['decimals'] == 0 ) {
+			$currency_unit_multiplier = 1;
+		}
+
+		/*
+		Figure out the trial length (first payment handled by initial charge)
+
+		There are two parts to the trial. Part 1 is simply the delay until the first payment
+        since we are doing the first payment as a separate transaction.
+        The second part is the actual "trial" set by the admin.
+
+        Stripe only supports Year or Month for billing periods, but we account for Days and Weeks just in case.
+        */
+		if ( $order->BillingPeriod == "Year" ) {
+			$trial_period_days = $order->BillingFrequency * 365;    //annual
+		} elseif ( $order->BillingPeriod == "Day" ) {
+			$trial_period_days = $order->BillingFrequency * 1;        //daily
+		} elseif ( $order->BillingPeriod == "Week" ) {
+			$trial_period_days = $order->BillingFrequency * 7;        //weekly
+		} else {
+			$trial_period_days = $order->BillingFrequency * 30;    //assume monthly
+		}
+
+		//convert to a profile start date
+		$order->ProfileStartDate = date_i18n( "Y-m-d", strtotime( "+ " . $trial_period_days . " Day", current_time( "timestamp" ) ) ) . "T0:0:0";
+
+		//filter the start date
+		$order->ProfileStartDate = apply_filters( "pmpro_profile_start_date", $order->ProfileStartDate, $order );
+
+		//convert back to days
+		$trial_period_days = ceil( abs( strtotime( date_i18n( "Y-m-d" ), current_time( "timestamp" ) ) - strtotime( $order->ProfileStartDate, current_time( "timestamp" ) ) ) / 86400 );
+
+		//for free trials, just push the start date of the subscription back
+		if ( ! empty( $order->TrialBillingCycles ) && $order->TrialAmount == 0 ) {
+			$trialOccurrences = (int) $order->TrialBillingCycles;
+			if ( $order->BillingPeriod == "Year" ) {
+				$trial_period_days = $trial_period_days + ( 365 * $order->BillingFrequency * $trialOccurrences );    //annual
+			} elseif ( $order->BillingPeriod == "Day" ) {
+				$trial_period_days = $trial_period_days + ( 1 * $order->BillingFrequency * $trialOccurrences );        //daily
+			} elseif ( $order->BillingPeriod == "Week" ) {
+				$trial_period_days = $trial_period_days + ( 7 * $order->BillingFrequency * $trialOccurrences );    //weekly
+			} else {
+				$trial_period_days = $trial_period_days + ( 30 * $order->BillingFrequency * $trialOccurrences );    //assume monthly
+			}
+		} elseif ( ! empty( $order->TrialBillingCycles ) ) {
+
+		}
+
+		// Save $trial_period_days to order for now too.
+		$order->TrialPeriodDays = $trial_period_days;
+
+
+		//check if Stripe Product for Membership Level exists
+		//@NOTE $order->membership_id || $order->membership_level->id
+		$stripe_product_id = $this->getStripeProductId( $order->membership_id );
+
+		if ( ! empty($stripe_product_id) ) {
+			//get Stripe Product data from Stripe
+			try {
+				$product = Stripe_Product::retrieve($stripe_product_id);
+			} catch ( \Throwable $e ) {
+				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			} catch ( \Exception $e ) {
+				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			}
+		} else {
+			//create a Stripe Product
+			try {
+				$product = array(
+					'name' => $order->membership_name,
+					'metadata' => array(
+						'pmpro_membership_level_id' => $order->membership_id
+					)
+				);
+				$product = Stripe_Product::create( apply_filters( 'pmpro_stripe_create_product_array', $product ) );
+
+				//save Stripe Product ID to pmpro_membership_levelmeta
+				//@NOTE adds or updates row metadata
+				$replaced = $wpdb->replace(
+					$wpdb->pmpro_membership_levelmeta,
+					array(
+						'pmpro_membership_level_id' => $order->membership_id,
+						'meta_key'                  => 'stripe_product_id',
+						'meta_value'                => $product->id
+					),
+					array(
+						'%d',
+						'%s',
+						'%s'
+					)
+				);
+
+				$stripe_product_id = $product->id;
+			} catch ( \Throwable $e ) {
+				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			} catch ( \Exception $e) {
+				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			}
+		}
+
+		//check if there's a Stripe Price === amount user will pay
+		$prices = $this->getStripePricesByProduct( $stripe_product_id );
+		$price_id = null;
+
+		if ( ! empty( $prices->data ) ) {
+			foreach ( $prices->data as $price ) {
+				if ( $price->unit_amount === $amount * $currency_unit_multiplier ) {
+					$price_id = $price->id;
+					break;
+				}
+			}
+		} else {
+			//create Stripe Price
+			try {
+				$price = array(
+					"currency"    => strtolower( $pmpro_currency ),
+					"product"     => $stripe_product_id,
+					"unit_amount" => $amount * $currency_unit_multiplier,
+					"recurring"   => array(
+						"interval"          => strtolower( $order->BillingPeriod ),
+						"interval_count"    => $order->BillingFrequency,
+						"trial_period_days" => $trial_period_days //@LINK https://stripe.com/docs/billing/migration/migrating-prices
+					),
+					"tax_behavior" => "unspecified",
+					"metadata"     => array(
+						"code" => $order->code //attach as metadata since Prices don't have `id` overrides
+					)
+				);
+				$price = self::add_application_fee_amount( $price );
+				$price = Stripe_Price::create( $price );
+				$price_id = $price->id;
+				$order->price = $price;
+			} catch ( \Throwable $e ) {
+				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			} catch ( \Exception $e) {
+				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
+				$order->shorterror = $order->error;
+
+				return false;
+			}
+		}
+
+		return $order->price; // @NOTE this mimics $order->plan
+	}
+
 	function create_plan( &$order ) {
 
 		global $pmpro_currencies, $pmpro_currency;
@@ -3385,174 +3574,6 @@ class PMProGateway_stripe extends PMProGateway {
 		return $order->plan;
 	}
 
-	function create_product( &$order ) {
-
-		global $pmpro_currencies, $pmpro_currency;
-
-		//figure out the amounts
-		$amount     = $order->PaymentAmount;
-		$amount_tax = $order->getTaxForPrice( $amount );
-		$amount     = pmpro_round_price( (float) $amount + (float) $amount_tax );
-
-		// Account for zero-decimal currencies like the Japanese Yen
-		$currency_unit_multiplier = 100; //ie 100 cents per USD
-		if ( is_array( $pmpro_currencies[ $pmpro_currency ] ) && isset( $pmpro_currencies[ $pmpro_currency ]['decimals'] ) && $pmpro_currencies[ $pmpro_currency ]['decimals'] == 0 ) {
-			$currency_unit_multiplier = 1;
-		}
-
-		/*
-		Figure out the trial length (first payment handled by initial charge)
-
-		There are two parts to the trial. Part 1 is simply the delay until the first payment
-        since we are doing the first payment as a separate transaction.
-        The second part is the actual "trial" set by the admin.
-
-        Stripe only supports Year or Month for billing periods, but we account for Days and Weeks just in case.
-        */
-		if ( $order->BillingPeriod == "Year" ) {
-			$trial_period_days = $order->BillingFrequency * 365;    //annual
-		} elseif ( $order->BillingPeriod == "Day" ) {
-			$trial_period_days = $order->BillingFrequency * 1;        //daily
-		} elseif ( $order->BillingPeriod == "Week" ) {
-			$trial_period_days = $order->BillingFrequency * 7;        //weekly
-		} else {
-			$trial_period_days = $order->BillingFrequency * 30;    //assume monthly
-		}
-
-		//convert to a profile start date
-		$order->ProfileStartDate = date_i18n( "Y-m-d", strtotime( "+ " . $trial_period_days . " Day", current_time( "timestamp" ) ) ) . "T0:0:0";
-
-		//filter the start date
-		$order->ProfileStartDate = apply_filters( "pmpro_profile_start_date", $order->ProfileStartDate, $order );
-
-		//convert back to days
-		$trial_period_days = ceil( abs( strtotime( date_i18n( "Y-m-d" ), current_time( "timestamp" ) ) - strtotime( $order->ProfileStartDate, current_time( "timestamp" ) ) ) / 86400 );
-
-		//for free trials, just push the start date of the subscription back
-		if ( ! empty( $order->TrialBillingCycles ) && $order->TrialAmount == 0 ) {
-			$trialOccurrences = (int) $order->TrialBillingCycles;
-			if ( $order->BillingPeriod == "Year" ) {
-				$trial_period_days = $trial_period_days + ( 365 * $order->BillingFrequency * $trialOccurrences );    //annual
-			} elseif ( $order->BillingPeriod == "Day" ) {
-				$trial_period_days = $trial_period_days + ( 1 * $order->BillingFrequency * $trialOccurrences );        //daily
-			} elseif ( $order->BillingPeriod == "Week" ) {
-				$trial_period_days = $trial_period_days + ( 7 * $order->BillingFrequency * $trialOccurrences );    //weekly
-			} else {
-				$trial_period_days = $trial_period_days + ( 30 * $order->BillingFrequency * $trialOccurrences );    //assume monthly
-			}
-		} elseif ( ! empty( $order->TrialBillingCycles ) ) {
-
-		}
-
-		// Save $trial_period_days to order for now too.
-		$order->TrialPeriodDays = $trial_period_days;
-
-
-		//check if Stripe Product for Membership Level exists
-		//@NOTE $order->membership_id || $order->membership_level->id
-		$stripe_product_id = $this->getStripeProductId($order->membership_id);
-
-		if ( ! empty($stripe_product_id) ) {
-			//get Stripe Product data from Stripe
-			try {
-				$product = Stripe_Product::retrieve($stripe_product_id);
-			} catch ( \Throwable $e ) {
-				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			} catch ( \Exception $e ) {
-				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			}
-		} else {
-			//create a Stripe Product
-			try {
-				$product = array(
-					'name' => $order->membership_name,
-					'metadata' => array(
-						'pmpro_membership_level_id' => $order->membership_id
-					)
-				);
-				$product = Stripe_Product::create( apply_filters( 'pmpro_stripe_create_product_array', $product ) );
-
-				//save Stripe Product ID to pmpro_membership_levelmeta
-				//@NOTE adds or updates row metadata
-				$replaced = $wpdb->replace(
-					$wpdb->pmpro_membership_levelmeta,
-					array(
-						'pmpro_membership_level_id' => $order->membership_id,
-						'meta_key'                  => 'stripe_product_id',
-						'meta_value'                => $product->id
-					),
-					array(
-						'%d',
-						'%s',
-						'%s'
-					)
-				);
-
-				$stripe_product_id = $product->id;
-			} catch ( \Throwable $e ) {
-				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			} catch ( \Exception $e) {
-				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			}
-		}
-
-		//check if there's a Stripe Price === amount user will pay
-		$prices = $this->getStripePricesByProduct( $stripe_product_id );
-		$price_id = null;
-
-		if ( ! empty( $prices->data ) ) {
-			foreach ( $prices->data as $price ) {
-				if ( $price->unit_amount === $amount * $currency_unit_multiplier ) {
-					$price_id = $price->id;
-					break;
-				}
-			}
-		} else {
-			//create Stripe Price
-			try {
-				$price = array(
-					"currency"    => strtolower( $pmpro_currency ),
-					"product"     => $stripe_product_id,
-					"unit_amount" => $amount * $currency_unit_multiplier,
-					"recurring"   => array(
-						"interval"          => strtolower( $order->BillingPeriod ),
-						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days
-					),
-					"tax_behavior" => "unspecified"
-				);
-				$price = self::add_application_fee_amount( $price );
-				$price = Stripe_Price::create( $price );
-				$price_id = $price->id;
-				$order->price = $price;
-			} catch ( \Throwable $e ) {
-				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			} catch ( \Exception $e) {
-				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			}
-		}
-
-		return $order->price; // @NOTE this mimics $order->plan
-	}
-
 	function create_subscription( &$order, $subscription ) {
 
 		//subscribe to the product
@@ -3561,9 +3582,9 @@ class PMProGateway_stripe extends PMProGateway {
 				'customer'               => $this->customer->id,
 				'default_payment_method' => $this->payment_method,
 				'items'                  => array(
-					array( "price" => $order->price->id )
+					array( 'price' => $order->price->id )
 				),
-				'trial_period_days'      => $order->TrialPeriodDays,
+				'trial_period_days'      => $order->TrialPeriodDays, //overrides value in plan/price
 				'expand'                 => array(
 					'pending_setup_intent.payment_method',
 				),
@@ -3676,7 +3697,6 @@ class PMProGateway_stripe extends PMProGateway {
 
 	function create_setup_intent( &$order ) {
 
-		// @TODO separation of concerns from subscribe() method
 		$this->create_product( $order );
 		$subscription = array(
 			array( "price" => $order->price->id )
