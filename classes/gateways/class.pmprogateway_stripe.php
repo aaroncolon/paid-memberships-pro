@@ -3382,7 +3382,7 @@ class PMProGateway_stripe extends PMProGateway {
 		if ( ! empty($stripe_product_id) ) {
 			//get Stripe Product data from Stripe
 			try {
-				$product = Stripe_Product::retrieve($stripe_product_id);
+				$product = Stripe_Product::retrieve( $stripe_product_id );
 			} catch ( \Throwable $e ) {
 				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
 				$order->shorterror = $order->error;
@@ -3406,20 +3406,35 @@ class PMProGateway_stripe extends PMProGateway {
 				$product = Stripe_Product::create( apply_filters( 'pmpro_stripe_create_product_array', $product ) );
 
 				//save Stripe Product ID to pmpro_membership_levelmeta
-				//@NOTE adds or updates row metadata
-				$replaced = $wpdb->replace(
-					$wpdb->pmpro_membership_levelmeta,
-					array(
-						'pmpro_membership_level_id' => $order->membership_id,
-						'meta_key'                  => 'stripe_product_id',
-						'meta_value'                => $product->id
-					),
-					array(
-						'%d',
-						'%s',
-						'%s'
-					)
+				$meta_id = $wpdb->get_var(
+				  $wpdb->prepare("
+				    SELECT meta_id
+				    FROM $wpdb->pmpro_membership_levelmeta
+				    WHERE pmpro_membership_level_id = %d
+							AND meta_key = 'stripe_product_id'
+				      AND meta_value = %s",
+				    array(
+							$order->membership_id,
+							$product->id
+						)
+				  )
 				);
+
+				if ( empty($meta_id) ) {
+					$inserted = $wpdb->insert(
+						$wpdb->pmpro_membership_levelmeta,
+						array(
+							'pmpro_membership_level_id' => $order->membership_id,
+							'meta_key'                  => 'stripe_product_id',
+							'meta_value'                => $product->id
+						),
+						array(
+							'%d',
+							'%s',
+							'%s'
+						)
+					);
+				}
 
 				$stripe_product_id = $product->id;
 			} catch ( \Throwable $e ) {
