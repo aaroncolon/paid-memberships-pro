@@ -443,6 +443,7 @@
 			return false;
 	}
 
+	//customer.subscription.deleted
 	function getUserFromCustomerEvent($pmpro_stripe_event, $status = false, $checkplan = true)
 	{
 		//pause here to give PMPro a chance to finish checkout
@@ -453,6 +454,10 @@
 		$customer_id = $pmpro_stripe_event->data->object->customer;
 		$subscription_id = $pmpro_stripe_event->data->object->id;
 		$plan_id = $pmpro_stripe_event->data->object->plan->id;
+		// add Prices support
+		if ( empty($plan_id) ) {
+			$plan_id = $pmpro_stripe_event->data->object->price->id;
+		}
 
 		//look up the order
 		$sqlQuery = "SELECT user_id FROM $wpdb->pmpro_membership_orders WHERE (subscription_transaction_id = '" . esc_sql($customer_id) . "' OR subscription_transaction_id = '"  . esc_sql($subscription_id) . "') ";
