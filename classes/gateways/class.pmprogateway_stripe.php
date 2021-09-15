@@ -2241,23 +2241,24 @@ class PMProGateway_stripe extends PMProGateway {
 		$sqlQuery = $wpdb->prepare("SELECT meta_value
 			FROM $wpdb->pmpro_membership_levelmeta
 			WHERE pmpro_membership_level_id = %d
-			AND meta_key = 'stripe_product_id'
+				AND meta_key = 'stripe_product_id'
 		", $level_id);
-		return $wpdb->get_row( $sqlQuery );
+
+		return $wpdb->get_var( $sqlQuery );
 	}
 
 	/**
 	 * Get Stripe Prices by Product ID.
 	 *
+	 * @param  object $order MemberOrder object
 	 * @param  string $level_id the PMPro membership level id
 	 * @return array|bool
 	 */
-	function getStripePricesByProduct( $product_id ) {
+	function getStripePricesByProduct( &$order, $product_id ) {
 		try {
 			$response = Stripe_Price::all( array(
 				'active'  => true,
-				'product' => $product_id,
-				'limit'   => 10
+				'product' => $product_id
 			) );
 		} catch ( \Throwable $e ) {
 			$order->errorcode  = true;
@@ -2389,30 +2390,15 @@ class PMProGateway_stripe extends PMProGateway {
 		$order->TrialPeriodDays = $trial_period_days;
 
 
-		
+
 
 
 
 		//check if Stripe Product for Membership Level exists
 		//@NOTE $order->membership_id || $order->membership_level->id
-		$stripe_product_id = $this->getStripeProductId($order->membership_id);
+		$stripe_product_id = $this->getStripeProductId( $order->membership_id );
 
-		if ( ! empty($stripe_product_id) ) {
-			//get Stripe Product data from Stripe
-			try {
-				$product = Stripe_Product::retrieve($stripe_product_id);
-			} catch ( \Throwable $e ) {
-				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			} catch ( \Exception $e ) {
-				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			}
-		} else {
+		if ( empty($stripe_product_id) ) {
 			//create a Stripe Product
 			try {
 				$product = array(
@@ -2454,24 +2440,32 @@ class PMProGateway_stripe extends PMProGateway {
 		}
 
 		//check if there's a Stripe Price === amount user will pay
-		$prices = $this->getStripePricesByProduct( $stripe_product_id );
+		$prices = $this->getStripePricesByProduct( $order, $stripe_product_id );
+		if ( $prices == false ) {
+			return false;
+		}
+
 		$price_id = null;
 
 		if ( ! empty( $prices->data ) ) {
 			foreach ( $prices->data as $price ) {
-				if ( $price->unit_amount === $amount * $currency_unit_multiplier ) {
+				if ( $price->unit_amount == $amount * $currency_unit_multiplier ) {
 					$price_id = $price->id;
 					$order->price = $price;
 					break;
 				}
 			}
-		} else {
+		}
+
+		if ( empty($price_id) ) {
 			//create Stripe Price
 			try {
 				//@NOTE According to documentation, Stripe Prices do not include an ID override (Plans do)
 				//Plan `id` was set to the MemberOrder `code`, for cross-refs.
 				//Plan `id` was passed to Stripe_Subscription::create as an `item[]`
 				//Adding as metadata->code for referencing if needed
+				//@LINK https://stripe.com/docs/billing/migration/migrating-prices
+				//metadata->code attach as metadata since Prices don't have `id` overrides
 				$price = array(
 					"currency"    => strtolower( $pmpro_currency ),
 					"product"     => $stripe_product_id,
@@ -2479,17 +2473,16 @@ class PMProGateway_stripe extends PMProGateway {
 					"recurring"   => array(
 						"interval"          => strtolower( $order->BillingPeriod ),
 						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days //@LINK https://stripe.com/docs/billing/migration/migrating-prices
+						"trial_period_days" => $trial_period_days
 					),
 					"tax_behavior" => "unspecified",
 					"metadata"     => array(
-						"code" => $order->code //attach as metadata since Prices don't have `id` overrides
+						"code" => $order->code
 					)
 				);
-				$price = self::add_application_fee_amount( $price );
-				$price = Stripe_Price::create( $price );
-				$price_id = $price->id;
-				$order->price = $price;
+				// $price = self::add_application_fee_amount( $price );
+				$order->price = Stripe_Price::create( $price );
+				$price_id = $order->price->id;
 			} catch ( \Throwable $e ) {
 				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
 				$order->shorterror = $order->error;
@@ -2553,7 +2546,7 @@ class PMProGateway_stripe extends PMProGateway {
 			$subscription = array(
 				array( "price" => $price_id )
 			);
-			$result       = $this->create_subscription( $order, $subscription );
+			$result       = $this->create_subscription( $order );
 		} catch ( \Throwable $e ) {
 			//give the user any old updates back
 			if ( ! empty( $user_id ) ) {
@@ -3317,7 +3310,7 @@ class PMProGateway_stripe extends PMProGateway {
 	 */
 	function create_product( &$order ) {
 
-		global $pmpro_currencies, $pmpro_currency;
+		global $wpdb, $pmpro_currencies, $pmpro_currency;
 
 		//figure out the amounts
 		$amount     = $order->PaymentAmount;
@@ -3382,22 +3375,7 @@ class PMProGateway_stripe extends PMProGateway {
 		//@NOTE $order->membership_id || $order->membership_level->id
 		$stripe_product_id = $this->getStripeProductId( $order->membership_id );
 
-		if ( ! empty($stripe_product_id) ) {
-			//get Stripe Product data from Stripe
-			try {
-				$product = Stripe_Product::retrieve( $stripe_product_id );
-			} catch ( \Throwable $e ) {
-				$order->error      = __( "Error creating product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			} catch ( \Exception $e ) {
-				$order->error      = __( "Error creating Product with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
-				$order->shorterror = $order->error;
-
-				return false;
-			}
-		} else {
+		if ( empty($stripe_product_id) ) {
 			//create a Stripe Product
 			try {
 				$product = array(
@@ -3454,18 +3432,27 @@ class PMProGateway_stripe extends PMProGateway {
 		}
 
 		//check if there's a Stripe Price === amount user will pay
-		$prices = $this->getStripePricesByProduct( $stripe_product_id );
+		$prices = $this->getStripePricesByProduct( $order, $stripe_product_id );
+		if ( $prices == false ) {
+			return false;
+		}
+
 		$price_id = null;
 
 		if ( ! empty( $prices->data ) ) {
 			foreach ( $prices->data as $price ) {
-				if ( $price->unit_amount === $amount * $currency_unit_multiplier ) {
+				if ( $price->unit_amount == $amount * $currency_unit_multiplier ) {
 					$price_id = $price->id;
+					$order->price = $price;
 					break;
 				}
 			}
-		} else {
+		}
+
+		if ( empty($price_id) ) {
 			//create Stripe Price
+			//@LINK https://stripe.com/docs/billing/migration/migrating-prices
+			//metadata->code add as metadata since Prices don't have `id` overrides
 			try {
 				$price = array(
 					"currency"    => strtolower( $pmpro_currency ),
@@ -3474,17 +3461,21 @@ class PMProGateway_stripe extends PMProGateway {
 					"recurring"   => array(
 						"interval"          => strtolower( $order->BillingPeriod ),
 						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days //@LINK https://stripe.com/docs/billing/migration/migrating-prices
+						"trial_period_days" => $trial_period_days
 					),
 					"tax_behavior" => "unspecified",
 					"metadata"     => array(
-						"code" => $order->code //attach as metadata since Prices don't have `id` overrides
+						"code" => $order->code
 					)
 				);
-				$price = self::add_application_fee_amount( $price );
-				$price = Stripe_Price::create( $price );
-				$price_id = $price->id;
-				$order->price = $price;
+
+				// $price = self::add_application_fee_amount( $price );
+				$order->price = Stripe_Price::create( $price );
+				$price_id = $order->price->id;
+			} catch ( Stripe\Error\Base $e ) {
+				$order->error = $e->getMessage();
+
+				return false;
 			} catch ( \Throwable $e ) {
 				$order->error      = __( "Error creating price with Stripe:", 'paid-memberships-pro' ) . $e->getMessage();
 				$order->shorterror = $order->error;
@@ -3498,7 +3489,7 @@ class PMProGateway_stripe extends PMProGateway {
 			}
 		}
 
-		return $order->price; // @NOTE this mimics $order->plan
+		return $order->price; // @NOTE mimics $order->plan
 	}
 
 	function create_plan( &$order ) {
@@ -3592,20 +3583,22 @@ class PMProGateway_stripe extends PMProGateway {
 		return $order->plan;
 	}
 
-	function create_subscription( &$order, $subscription ) {
-
+	function create_subscription( &$order ) {
+		//existing prices return arrays, created prices return objects
+		$order_id = (is_array($order->price)) ? $order->price['id'] : $order->price->id;
 		//subscribe to the product
+		//trial_period_days overrides value in plan/price
 		try {
 			$params              = array(
 				'customer'               => $this->customer->id,
 				'default_payment_method' => $this->payment_method,
 				'items'                  => array(
-					array( 'price' => $order->price->id )
+					array( 'price' => $order_id )
 				),
-				'trial_period_days'      => $order->TrialPeriodDays, //overrides value in plan/price
+				'trial_period_days'      => $order->TrialPeriodDays,
 				'expand'                 => array(
 					'pending_setup_intent.payment_method',
-				),
+				)
 			);
 			if ( ! self::using_legacy_keys() ) {
 				$params['application_fee_percent'] = self::get_application_fee_percentage();
@@ -3715,11 +3708,12 @@ class PMProGateway_stripe extends PMProGateway {
 
 	function create_setup_intent( &$order ) {
 
-		$this->create_product( $order );
-		$subscription = array(
-			array( "price" => $order->price->id )
-		);
-		$this->subscription = $this->create_subscription( $order, $subscription );
+		$price = $this->create_product( $order );
+
+		// $subscription = array(
+		// 	array( "price" => $order->price->id )
+		// );
+		$this->subscription = $this->create_subscription( $order );
 
 		// $this->create_plan( $order );
 		// $this->subscription = $this->create_subscription( $order );
