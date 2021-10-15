@@ -2473,7 +2473,7 @@ class PMProGateway_stripe extends PMProGateway {
 					"recurring"   => array(
 						"interval"          => strtolower( $order->BillingPeriod ),
 						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days
+						// "trial_period_days" => $trial_period_days // @NOTE Deprecated. Specify per Subscription.
 					),
 					"tax_behavior" => "unspecified",
 					"metadata"     => array(
@@ -3461,7 +3461,7 @@ class PMProGateway_stripe extends PMProGateway {
 					"recurring"   => array(
 						"interval"          => strtolower( $order->BillingPeriod ),
 						"interval_count"    => $order->BillingFrequency,
-						"trial_period_days" => $trial_period_days
+						// "trial_period_days" => $trial_period_days // @NOTE Deprecated. Specify per subscription.
 					),
 					"tax_behavior" => "unspecified",
 					"metadata"     => array(
